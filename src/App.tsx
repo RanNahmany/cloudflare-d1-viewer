@@ -30,12 +30,19 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useMemoizedFn } from "ahooks";
 import prettyBytes from "pretty-bytes";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
 import initSqlJs, { Database } from "sql.js";
 import wretch from "wretch";
 import { GetUserResponse, ListDatabaseResponse, RunSQLResponse } from "./cf";
 import { DataTable } from "./components/data-table";
-import { TableData, createColumns } from "./components/data-table-columns";
+import {
+  DirtyChanges,
+  EditingState,
+  TableData,
+  createColumns,
+} from "./components/data-table-columns";
+import { Toaster } from "./components/ui/sonner";
 import { generateCloudflareTokenLink, sleep } from "./helper";
 
 function App() {
@@ -61,6 +68,15 @@ function App() {
   const [localTable, setLocalTable] = useState<string>("");
   const [limit, setLimit] = useState<number>(50);
   const [page, setPage] = useState<number>(1);
+  const [editingState, setEditingState] = useState<EditingState>({});
+  const [dirtyChanges, setDirtyChanges] = useState<DirtyChanges>({});
+  const [localData, setLocalData] = useState<{
+    head: string[];
+    body: TableData[];
+  }>({ head: [], body: [] });
+  const [pendingTableSwitch, setPendingTableSwitch] = useState<string | null>(
+    null,
+  );
 
   const {
     data: accounts,
@@ -277,7 +293,7 @@ function App() {
     enabled: shouldFetchFetchRemoteData || shouldFetchFetchLocalData,
   });
 
-  const data = useMemo(() => {
+  useMemo(() => {
     const columns = selectResult?.result.at(0)?.results.columns;
     const rows = selectResult?.result.at(0)?.results.rows;
 
@@ -294,15 +310,242 @@ function App() {
       return rowData;
     });
 
-    return {
+    const newData = {
       head: columns,
       body: tableData,
     };
+
+    // Update local data state
+    setLocalData(newData);
   }, [selectResult]);
 
+  // Editing functions
+  const handleStartEdit = useCallback((rowId: string, columnId: string) => {
+    setEditingState((prev) => ({
+      ...prev,
+      [rowId]: {
+        ...prev[rowId],
+        [columnId]: true,
+      },
+    }));
+  }, []);
+
+  const handleRevertEdit = () => {
+    // Revert all local data changes back to original values
+    setLocalData((prev) => {
+      const revertedBody = prev.body.map((row: TableData, rowIndex: number) => {
+        const rowId = rowIndex.toString();
+        const dirtyRowChanges = dirtyChanges[rowId];
+
+        if (!dirtyRowChanges) {
+          return row; // No changes for this row
+        }
+
+        // Revert each changed column back to original value
+        const revertedRow = { ...row };
+        Object.entries(dirtyRowChanges).forEach(([columnId, change]) => {
+          revertedRow[columnId] = change.originalValue;
+        });
+
+        return revertedRow;
+      });
+
+      return {
+        ...prev,
+        body: revertedBody,
+      };
+    });
+
+    // Clear all dirty changes
+    setDirtyChanges({});
+
+    // Clear all editing states
+    setEditingState({});
+
+    // Show success toast
+    // toast.success("All changes reverted", {
+    //   description: "Your local changes have been discarded"
+    // });
+  };
+
+  const handleSaveEdit = useCallback(
+    (rowId: string, columnId: string, newValue: any) => {
+      const originalValue = localData.body.find(
+        (_, index) => index.toString() === rowId,
+      )?.[columnId];
+
+      // Update the local data
+      setLocalData((prev) => ({
+        ...prev,
+        body: prev.body.map((row: TableData, index: number) =>
+          index.toString() === rowId ? { ...row, [columnId]: newValue } : row,
+        ),
+      }));
+
+      // Mark as dirty if value changed
+      if (originalValue !== newValue) {
+        setDirtyChanges((prev) => ({
+          ...prev,
+          [rowId]: {
+            ...prev[rowId],
+            [columnId]: {
+              originalValue,
+              newValue,
+            },
+          },
+        }));
+
+        // Show toast for individual cell edit
+        // toast.success("Cell updated", {
+        //   description: `${columnId}: ${originalValue} → ${newValue}`
+        // });
+      }
+
+      // Exit editing mode
+      setEditingState((prev) => ({
+        ...prev,
+        [rowId]: {
+          ...prev[rowId],
+          [columnId]: false,
+        },
+      }));
+    },
+    [localData.body],
+  );
+
+  const handleCancelEdit = useCallback((rowId: string, columnId: string) => {
+    setEditingState((prev) => ({
+      ...prev,
+      [rowId]: {
+        ...prev[rowId],
+        [columnId]: false,
+      },
+    }));
+  }, []);
+
+  const handleSaveChanges = async () => {
+    const toastId = toast.loading("Saving changes...", {
+      description: "Please wait while we update the database",
+    });
+
+    try {
+      // Generate safe UPDATE statements for each dirty change
+      const updateStatements: string[] = [];
+
+      for (const [rowId, columnChanges] of Object.entries(dirtyChanges)) {
+        const rowIndex = parseInt(rowId);
+        const row = localData.body[rowIndex];
+
+        // Get primary key or row identifier (assuming first column is ID)
+        const primaryKey = localData.head[0]; // Assuming first column is primary key
+        const primaryKeyValue = row[primaryKey];
+
+        if (!primaryKeyValue) {
+          throw new Error(
+            `Cannot update row ${rowIndex}: No primary key value found`,
+          );
+        }
+
+        // Build UPDATE statement with parameterized values
+        const setClauses: string[] = [];
+        const params: any[] = [];
+
+        for (const [columnId, change] of Object.entries(columnChanges)) {
+          setClauses.push(`${columnId} = ?`);
+          params.push(change.newValue);
+        }
+
+        const updateSQL = `UPDATE ${dbType === "cloudflare" ? remoteTable : localTable} SET ${setClauses.join(", ")} WHERE ${primaryKey} = ?`;
+        params.push(primaryKeyValue);
+
+        updateStatements.push(updateSQL);
+
+        // Execute the update
+        if (dbType === "cloudflare") {
+          await wretch(
+            `/api/client/v4/accounts/${accountId}/d1/database/${databaseId}/raw`,
+          )
+            .headers({
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            })
+            .post({
+              sql: updateSQL,
+              params: params,
+            })
+            .json<RunSQLResponse>();
+        } else {
+          // For local SQLite
+          if (localDb) {
+            const stmt = localDb.prepare(updateSQL);
+            stmt.run(...params);
+            stmt.free();
+          }
+        }
+      }
+
+      console.log("Successfully saved changes:", updateStatements);
+
+      // Clear dirty changes after successful save
+      setDirtyChanges({});
+
+      // Refresh the data to show updated values
+      refetchRows();
+
+      toast.success("Changes saved successfully!", {
+        id: toastId,
+        description: `Updated ${Object.keys(dirtyChanges).length} row(s)`,
+      });
+    } catch (error) {
+      console.error("Failed to save changes:", error);
+      toast.error("Failed to save changes", {
+        id: toastId,
+        description:
+          error instanceof Error
+            ? error.message
+            : "An unexpected error occurred",
+      });
+      throw error; // Re-throw to show error in UI
+    }
+  };
+
+  const hasUnsavedChanges = Object.keys(dirtyChanges).length > 0;
+
+  const handleTableSwitch = () => {
+    if (pendingTableSwitch) {
+      if (dbType === "cloudflare") {
+        setRemoteTable(pendingTableSwitch);
+      } else {
+        setLocalTable(pendingTableSwitch);
+      }
+      setPendingTableSwitch(null);
+      // Clear editing state when switching tables
+      setEditingState({});
+      setDirtyChanges({});
+    }
+  };
+
+  const cancelTableSwitch = () => {
+    setPendingTableSwitch(null);
+  };
+
   const columns = useMemo(() => {
-    return createColumns(data.head);
-  }, [data.head]);
+    return createColumns(
+      localData.head,
+      editingState,
+      dirtyChanges,
+      handleStartEdit,
+      handleSaveEdit,
+      handleCancelEdit,
+    );
+  }, [
+    localData.head,
+    editingState,
+    dirtyChanges,
+    handleStartEdit,
+    handleSaveEdit,
+    handleCancelEdit,
+  ]);
 
   const handleOpenLocalSQLiteFile = useMemoizedFn(async () => {
     try {
@@ -515,6 +758,11 @@ function App() {
               }
               color="blue"
               onClick={() => {
+                if (hasUnsavedChanges) {
+                  // Set pending table switch to trigger dialog
+                  setPendingTableSwitch(i);
+                  return;
+                }
                 if (dbType === "cloudflare") {
                   setRemoteTable(i);
                 } else {
@@ -545,8 +793,18 @@ function App() {
           </Stack>
         ) : (
           <div className="p-4">
-            {data.head.length > 0 && data.body.length > 0 ? (
-              <DataTable columns={columns} data={data.body} />
+            {localData.head.length > 0 && localData.body.length > 0 ? (
+              <DataTable
+                columns={columns}
+                data={localData.body}
+                onSaveChanges={handleSaveChanges}
+                hasUnsavedChanges={hasUnsavedChanges}
+                dirtyChanges={dirtyChanges}
+                onRevertEdit={handleRevertEdit}
+                onTableSwitch={handleTableSwitch}
+                onCancelTableSwitch={cancelTableSwitch}
+                showTableSwitchDialog={!!pendingTableSwitch}
+              />
             ) : (
               <Text c="dimmed" size="xs" p={8}>
                 No data found
@@ -662,6 +920,7 @@ function App() {
           </Group>
         </Stack>
       </Modal>
+      <Toaster />
     </AppShell>
   );
 }
