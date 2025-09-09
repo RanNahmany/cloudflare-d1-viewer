@@ -10,12 +10,10 @@ import {
   NavLink,
   NumberInput,
   PasswordInput,
-  ScrollArea,
   SegmentedControl,
   Select,
   Skeleton,
   Stack,
-  Table,
   Text,
 } from "@mantine/core";
 import { useDisclosure, useLocalStorage } from "@mantine/hooks";
@@ -36,6 +34,8 @@ import { useEffect, useMemo, useState } from "react";
 import initSqlJs, { Database } from "sql.js";
 import wretch from "wretch";
 import { GetUserResponse, ListDatabaseResponse, RunSQLResponse } from "./cf";
+import { DataTable } from "./components/data-table";
+import { TableData, createColumns } from "./components/data-table-columns";
 import { generateCloudflareTokenLink, sleep } from "./helper";
 
 function App() {
@@ -278,15 +278,31 @@ function App() {
   });
 
   const data = useMemo(() => {
-    // return generateMockTableData(20, 100); // 20 columns, 100 rows
     const columns = selectResult?.result.at(0)?.results.columns;
     const rows = selectResult?.result.at(0)?.results.rows;
 
+    if (!columns || !rows) {
+      return { head: [], body: [] };
+    }
+
+    // Convert rows to objects with column names as keys
+    const tableData: TableData[] = rows.map((row: any[]) => {
+      const rowData: TableData = {};
+      columns.forEach((column: string, index: number) => {
+        rowData[column] = row[index];
+      });
+      return rowData;
+    });
+
     return {
-      head: columns ?? [],
-      body: rows ?? [],
+      head: columns,
+      body: tableData,
     };
   }, [selectResult]);
+
+  const columns = useMemo(() => {
+    return createColumns(data.head);
+  }, [data.head]);
 
   const handleOpenLocalSQLiteFile = useMemoizedFn(async () => {
     try {
@@ -528,36 +544,15 @@ function App() {
             <Skeleton height={16} />
           </Stack>
         ) : (
-          <Table.ScrollContainer minWidth="100%">
+          <div className="p-4">
             {data.head.length > 0 && data.body.length > 0 ? (
-              <Table striped highlightOnHover withRowBorders={false}>
-                <Table.Thead>
-                  <Table.Tr>
-                    {data.head.map((i) => (
-                      <Table.Th key={i}>{i}</Table.Th>
-                    ))}
-                  </Table.Tr>
-                </Table.Thead>
-                <Table.Tbody>
-                  {data.body.map((i) => (
-                    <Table.Tr key={i.join(",")}>
-                      {i.map((j) => (
-                        <Table.Td key={j}>
-                          <ScrollArea.Autosize mah={100}>
-                            {j.toString()}
-                          </ScrollArea.Autosize>
-                        </Table.Td>
-                      ))}
-                    </Table.Tr>
-                  ))}
-                </Table.Tbody>
-              </Table>
+              <DataTable columns={columns} data={data.body} />
             ) : (
               <Text c="dimmed" size="xs" p={8}>
                 No data found
               </Text>
             )}
-          </Table.ScrollContainer>
+          </div>
         )}
       </AppShell.Main>
 

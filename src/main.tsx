@@ -1,5 +1,5 @@
-import "@mantine/core/styles.css";
 import "./index.css";
+import "@mantine/core/styles.css";
 
 import { Loader, MantineProvider, createTheme } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
